@@ -341,40 +341,83 @@ function generateDemoData() {
 // ANALYSIS ENGINE
 // ════════════════════════════════════════════════════════════════
 function runAnalysis(pnlData, glRows, months, assumptions) {
-  // Build vendor by account
+  // Build GL vendor aggregation by account code AND account name (for fuzzy matching)
   const vendorByAccount = {};
+  const vendorByName = {};
   const allVendors = {};
 
   glRows.forEach(row => {
     const key = `${row.accountCode}|${row.vendor}`;
-    if (!vendorByAccount[key]) vendorByAccount[key] = { accountCode: row.accountCode, vendor: row.vendor, total: 0, count: 0 };
+    if (!vendorByAccount[key]) vendorByAccount[key] = { accountCode: row.accountCode, accountName: row.accountName, vendor: row.vendor, total: 0, count: 0 };
     vendorByAccount[key].total += row.net;
     vendorByAccount[key].count += 1;
+
+    // Also index by normalised account name for fuzzy matching
+    const normName = row.accountName.trim().toLowerCase().replace(/\s+/g, " ");
+    if (normName) {
+      const nameKey = `${normName}|${row.vendor}`;
+      if (!vendorByName[nameKey]) vendorByName[nameKey] = { accountName: normName, vendor: row.vendor, total: 0, count: 0 };
+      vendorByName[nameKey].total += row.net;
+      vendorByName[nameKey].count += 1;
+    }
 
     if (!allVendors[row.vendor]) allVendors[row.vendor] = { total: 0, count: 0, categories: new Set() };
     allVendors[row.vendor].total += Math.abs(row.net);
     allVendors[row.vendor].count += 1;
   });
 
-  // Build expense breakdown
+  // Build expense breakdown with fuzzy matching
   const expenseBreakdown = [];
-  const pnlLines = pnlData.filter(r => r.code && r.type !== "total");
+  const pnlLines = pnlData.filter(r => r.code && r.type !== "total" && r.type !== "header");
 
   pnlLines.forEach(line => {
     const pnlTotal = months.reduce((s, m) => s + Math.abs(parseAccNum(line[m])), 0);
     if (pnlTotal === 0) return;
     const category = classifyPnlLine(line.desc);
-    const accountVendors = Object.values(vendorByAccount).filter(v => v.accountCode === line.code);
+
+    // Try direct code match first
+    let accountVendors = Object.values(vendorByAccount).filter(v => v.accountCode === line.code);
+
+    // If no match, try fuzzy: match by normalised description
+    if (accountVendors.length === 0) {
+      const normDesc = line.desc.trim().toLowerCase().replace(/\s+/g, " ");
+      accountVendors = Object.values(vendorByName).filter(v => {
+        // Exact name match
+        if (v.accountName === normDesc) return true;
+        // Substring match (GL name contains P&L desc or vice versa)
+        if (v.accountName.includes(normDesc) || normDesc.includes(v.accountName)) return true;
+        // Prefix match on codes (e.g., P&L "4101" matches GL "4100000" — first 3-4 digits)
+        return false;
+      });
+    }
+
+    // If still no match, try prefix matching on account codes
+    if (accountVendors.length === 0 && line.code.length >= 3) {
+      const prefix = line.code.substring(0, Math.min(line.code.length, 4));
+      accountVendors = Object.values(vendorByAccount).filter(v =>
+        v.accountCode.startsWith(prefix)
+      );
+    }
+
     const glTotal = accountVendors.reduce((s, v) => s + Math.abs(v.total), 0);
     const vendors = accountVendors.map(v => ({ name: v.vendor, amount: Math.abs(v.total), count: v.count })).sort((a, b) => b.amount - a.amount);
 
+    // Merge duplicate vendor names
+    const mergedVendors = [];
+    const vendorMap = {};
     vendors.forEach(v => {
+      if (vendorMap[v.name]) { vendorMap[v.name].amount += v.amount; vendorMap[v.name].count += v.count; }
+      else { vendorMap[v.name] = { ...v }; mergedVendors.push(vendorMap[v.name]); }
+    });
+    mergedVendors.sort((a, b) => b.amount - a.amount);
+
+    mergedVendors.forEach(v => {
       if (allVendors[v.name]) allVendors[v.name].categories.add(category);
     });
 
     expenseBreakdown.push({
       pnlLine: line.desc, accountCode: line.code, pnlAmount: pnlTotal,
-      glTotal, variance: pnlTotal - glTotal, vendors, category,
+      glTotal, variance: pnlTotal - glTotal, vendors: mergedVendors, category,
       monthValues: months.map(m => Math.abs(parseAccNum(line[m]))),
     });
   });
@@ -1065,28 +1108,67 @@ function NotesTab({ analysis }) {
 // ════════════════════════════════════════════════════════════════
 // FILE UPLOAD HANDLER
 // ════════════════════════════════════════════════════════════════
-// GL sheet detection: must have columns like Date, Debit/Credit, Description/Narration
-const GL_SIGNATURES = ["debit", "credit", "narration", "description", "reference", "ref", "memo", "contact", "vendor", "supplier"];
-const PNL_KEYWORDS = ["revenue", "sales", "turnover", "income", "cost of goods", "cogs", "gross profit", "operating", "net profit", "ebitda"];
+// ════════════════════════════════════════════════════════════════
+// SMART FILE PARSING — handles headers not in row 1, grouped GL formats
+// ════════════════════════════════════════════════════════════════
 
-function classifySheet(headers, rows) {
-  const lower = headers.map(h => String(h).toLowerCase().trim());
-  // GL sheets have debit/credit columns or amount + date + description
-  const hasDebitCredit = lower.some(h => h.includes("debit")) && lower.some(h => h.includes("credit"));
-  const hasAmount = lower.some(h => h === "amount" || h === "gross" || h === "net amount");
-  const hasDate = lower.some(h => h.includes("date"));
-  const hasDesc = lower.some(h => ["description", "narration", "memo", "details"].some(k => h.includes(k)));
-  const hasAcctCode = lower.some(h => ["account code", "account", "acct", "nominal code", "gl code"].some(k => h.includes(k)));
-  const glScore = (hasDebitCredit ? 3 : 0) + (hasAmount ? 2 : 0) + (hasDate ? 2 : 0) + (hasDesc ? 2 : 0) + (hasAcctCode ? 1 : 0);
+const PNL_KEYWORDS = ["revenue", "sales", "turnover", "income", "cost of goods", "cogs", "gross profit", "operating", "net profit", "ebitda", "staff cost", "manpower"];
 
-  // P&L sheets have month/period columns and line item descriptions with financial keywords
-  const monthPattern = /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|q[1-4]|ytd|total|fy|full year)/i;
-  const monthCols = headers.filter(h => monthPattern.test(String(h).trim()));
-  const descValues = rows.slice(0, 30).map(r => String(r[headers[0]] || r[headers[1]] || "").toLowerCase());
-  const pnlKeywordHits = descValues.filter(v => PNL_KEYWORDS.some(kw => v.includes(kw))).length;
-  const pnlScore = monthCols.length * 2 + pnlKeywordHits;
+// Read raw sheet as array-of-arrays (no header assumption)
+function sheetToAoA(wb, sheetName) {
+  const sheet = wb.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+}
 
-  return { glScore, pnlScore, monthCols: monthCols.length, headers };
+// Find the header row by scanning for rows with multiple non-empty text cells
+function findHeaderRow(aoa, maxScan = 20) {
+  for (let i = 0; i < Math.min(aoa.length, maxScan); i++) {
+    const row = aoa[i];
+    const textCells = row.filter(v => v !== "" && v != null && typeof v === "string" && v.trim().length > 1);
+    if (textCells.length >= 3) {
+      // Check if this looks like a header (multiple short text labels)
+      const avgLen = textCells.reduce((s, v) => s + v.length, 0) / textCells.length;
+      if (avgLen < 40) return i;
+    }
+  }
+  return 0;
+}
+
+// Classify a sheet by scanning its content
+function classifySheet(aoa, sheetName) {
+  const lower = sheetName.toLowerCase();
+  let glScore = 0, pnlScore = 0;
+
+  // Sheet name hints
+  if (lower.includes("gl") || lower.includes("general ledger") || lower.includes("ledger") || lower.includes("detail") || lower.includes("transaction")) glScore += 5;
+  if (lower.includes("p&l") || lower.includes("pnl") || lower.includes("pl ") || lower.includes("pl_") || lower.includes("profit") || lower.includes("income statement") || lower.includes("income") || lower.includes("summary")) pnlScore += 5;
+
+  // Scan first 30 rows for content patterns
+  const sample = aoa.slice(0, 30).map(row => row.map(v => String(v || "").toLowerCase()));
+
+  // GL patterns: look for "account code", "transaction date", "journal", "dr/cr", "debit", "credit", "base amount"
+  const glKeywords = ["account code", "transaction date", "journal", "dr/cr", "debit", "credit", "base amount", "transaction amount", "narration", "balance brought forward"];
+  sample.forEach(row => {
+    const rowText = row.join(" ");
+    glKeywords.forEach(kw => { if (rowText.includes(kw)) glScore += 2; });
+  });
+
+  // P&L patterns: look for month columns, financial line items
+  const monthPattern = /^(oct|nov|dec|jan|feb|mar|apr|may|jun|jul|aug|sep|q[1-4]|ytd)\s*['`]?\d{2}/i;
+  sample.forEach(row => {
+    row.forEach(cell => {
+      if (monthPattern.test(cell)) pnlScore += 1;
+    });
+    const rowText = row.join(" ");
+    if (PNL_KEYWORDS.some(kw => rowText.includes(kw))) pnlScore += 1;
+  });
+
+  // Also check for "GL Code" or "GL Description" columns (P&L column headers)
+  sample.forEach(row => {
+    if (row.some(c => c === "gl code" || c === "gl description")) pnlScore += 3;
+  });
+
+  return { glScore, pnlScore, rowCount: aoa.length };
 }
 
 function parseWorkbook(file) {
@@ -1098,13 +1180,16 @@ function parseWorkbook(file) {
         const wb = XLSX.read(data, { type: "array" });
         const sheets = {};
         wb.SheetNames.forEach(name => {
-          const sheet = wb.Sheets[name];
-          const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-          const columns = json.length > 0 ? Object.keys(json[0]) : [];
-          const classification = classifySheet(columns, json);
-          sheets[name] = { data: json, columns, rowCount: json.length, ...classification };
+          const aoa = sheetToAoA(wb, name);
+          const headerRow = findHeaderRow(aoa);
+          const headers = (aoa[headerRow] || []).map((v, i) => {
+            const s = String(v || "").trim();
+            return s || `Col_${i}`;
+          });
+          const classification = classifySheet(aoa, name);
+          sheets[name] = { aoa, headers, headerRow, rowCount: aoa.length, columns: headers.filter(h => !h.startsWith("Col_")), ...classification };
         });
-        resolve({ sheetNames: wb.SheetNames, sheets, fileName: file.name });
+        resolve({ sheetNames: wb.SheetNames, sheets, fileName: file.name, _wb: wb });
       } catch (err) { reject(err); }
     };
     reader.onerror = reject;
@@ -1116,28 +1201,234 @@ function autoDetectSheets(workbook) {
   const { sheets, sheetNames } = workbook;
   let pnlSheet = null, glSheet = null;
 
-  // Score each sheet
-  const scored = sheetNames.map(name => {
-    const s = sheets[name];
-    return { name, glScore: s.glScore, pnlScore: s.pnlScore, rows: s.rowCount };
-  });
+  const scored = sheetNames.map(name => ({
+    name, glScore: sheets[name].glScore, pnlScore: sheets[name].pnlScore, rows: sheets[name].rowCount
+  }));
 
-  // Also check sheet name hints
-  scored.forEach(s => {
-    const lower = s.name.toLowerCase();
-    if (lower.includes("gl") || lower.includes("general ledger") || lower.includes("ledger") || lower.includes("detail") || lower.includes("transaction")) s.glScore += 5;
-    if (lower.includes("p&l") || lower.includes("pnl") || lower.includes("profit") || lower.includes("income") || lower.includes("summary")) s.pnlScore += 5;
-  });
+  // Pick best P&L and GL (must be different sheets, ignore tiny/internal sheets)
+  const viable = scored.filter(s => s.rows > 5);
+  const byPnl = [...viable].sort((a, b) => b.pnlScore - a.pnlScore);
+  const byGl = [...viable].sort((a, b) => b.glScore - a.glScore);
 
-  // Pick best GL and best P&L (must be different sheets)
-  const byGl = [...scored].sort((a, b) => b.glScore - a.glScore);
-  const byPnl = [...scored].sort((a, b) => b.pnlScore - a.pnlScore);
-
-  if (byPnl[0].pnlScore > 0) pnlSheet = byPnl[0].name;
-  if (byGl[0].glScore > 0 && byGl[0].name !== pnlSheet) glSheet = byGl[0].name;
+  if (byPnl.length > 0 && byPnl[0].pnlScore > 0) pnlSheet = byPnl[0].name;
+  if (byGl.length > 0 && byGl[0].glScore > 0 && byGl[0].name !== pnlSheet) glSheet = byGl[0].name;
   else if (byGl.length > 1 && byGl[1].glScore > 0) glSheet = byGl[1].name;
 
   return { pnlSheet, glSheet, scored };
+}
+
+// ════════════════════════════════════════════════════════════════
+// PARSE P&L FROM RAW AOA — handles headers not in row 1, interleaved prior-year columns
+// ════════════════════════════════════════════════════════════════
+function parsePnlSheet(aoa) {
+  // Find header row
+  const headerIdx = findHeaderRow(aoa);
+  const headers = aoa[headerIdx] || [];
+
+  // Identify code column, description column, and month columns
+  let codeColIdx = -1, descColIdx = -1;
+  const monthColIndices = [];
+  const monthNames = [];
+
+  headers.forEach((h, i) => {
+    const s = String(h || "").trim().toLowerCase();
+    if (s === "gl code" || s === "account code" || s === "code" || s === "account") codeColIdx = i;
+    if (s === "gl description" || s === "description" || s === "account name" || s === "name") descColIdx = i;
+    // Match current-year month columns: "Oct '25", "Nov '25", "Jan '26", "Mar '26" etc.
+    // But NOT "Last Yr Var", "Var %", or prior year columns
+    const monthMatch = String(h || "").trim().match(/^((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s*['`]?\d{2,4})$/i);
+    if (monthMatch) {
+      monthColIndices.push(i);
+      monthNames.push(monthMatch[1].trim());
+    }
+  });
+
+  // If we have duplicate-looking months (current + prior year), filter to just current year
+  // Group by month name prefix, pick the first occurrence of each
+  if (monthNames.length > 6) {
+    // Likely has both current and prior year — need to deduplicate
+    // The pattern is: Oct '25, Oct '24, Var, Var%, Nov '25, Nov '24, Var, Var%
+    // We want the first of each pair (current year)
+    const seen = new Set();
+    const filtered = [];
+    const filteredNames = [];
+    for (let i = 0; i < monthNames.length; i++) {
+      const monthPrefix = monthNames[i].replace(/['`]?\d{2,4}$/, "").trim().toLowerCase();
+      if (!seen.has(monthPrefix)) {
+        seen.add(monthPrefix);
+        filtered.push(monthColIndices[i]);
+        filteredNames.push(monthNames[i]);
+      }
+    }
+    monthColIndices.length = 0;
+    monthNames.length = 0;
+    filtered.forEach((idx, i) => { monthColIndices.push(idx); monthNames.push(filteredNames[i]); });
+  }
+
+  // Fallback: if no code/desc columns found, guess from position
+  if (codeColIdx === -1) {
+    // Try to find the first column with account-code-like values in data rows
+    for (let c = 0; c < (headers.length < 6 ? headers.length : 6); c++) {
+      const vals = aoa.slice(headerIdx + 1, headerIdx + 20).map(r => String(r[c] || "").trim()).filter(Boolean);
+      if (vals.some(v => /^\d{3,}$/.test(v))) { codeColIdx = c; break; }
+    }
+  }
+  if (descColIdx === -1) {
+    // Description is usually the column with longest text strings
+    let bestCol = codeColIdx === 0 ? 1 : 0;
+    let bestLen = 0;
+    for (let c = 0; c < Math.min(headers.length, 6); c++) {
+      if (c === codeColIdx || monthColIndices.includes(c)) continue;
+      const avgLen = aoa.slice(headerIdx + 1, headerIdx + 20).reduce((s, r) => s + String(r[c] || "").trim().length, 0);
+      if (avgLen > bestLen) { bestLen = avgLen; bestCol = c; }
+    }
+    descColIdx = bestCol;
+  }
+
+  // Parse data rows
+  const pnlData = [];
+  for (let i = headerIdx + 1; i < aoa.length; i++) {
+    const row = aoa[i];
+    const code = String(row[codeColIdx] || "").trim().replace(/^<<.*$/, ""); // Strip Sun Systems formula markers
+    const desc = String(row[descColIdx] || "").trim();
+    if (!desc) continue; // skip empty rows
+
+    const r = { code, desc, type: "expense" };
+    const upper = desc.toUpperCase();
+    const isTotal = ["TOTAL", "GROSS PROFIT", "NET PROFIT", "EBITDA", "PROFIT & LOSS", "GROSS PROFIT %"].some(kw => upper.includes(kw));
+    if (isTotal) r.type = "total";
+    if (upper.includes("REVENUE") || upper.includes("SALES") || upper.includes("INCOME")) {
+      if (!isTotal && !upper.includes("COST") && !upper.includes("EXPENSE")) r.type = "revenue";
+    }
+    // Section headers (no values)
+    const hasValues = monthColIndices.some(ci => {
+      const v = row[ci];
+      return v !== "" && v != null && v !== 0 && String(v).trim() !== "";
+    });
+    if (!hasValues && !isTotal) r.type = "header";
+
+    monthNames.forEach((m, mi) => {
+      r[m] = parseAccNum(row[monthColIndices[mi]]);
+    });
+    pnlData.push(r);
+  }
+
+  return { pnlData, months: monthNames };
+}
+
+// ════════════════════════════════════════════════════════════════
+// PARSE GL FROM RAW AOA — handles Sun Systems grouped format
+// ════════════════════════════════════════════════════════════════
+function parseGlSheet(aoa) {
+  const glRows = [];
+  let currentAccountCode = "";
+  let currentAccountName = "";
+
+  // Detect format: is this a flat table or grouped Sun Systems format?
+  // Sun Systems: rows with "Account Code" label followed by code and name
+  const isSunSystems = aoa.some(row => row.some(cell => String(cell || "").trim() === "Account Code"));
+
+  if (isSunSystems) {
+    // Grouped format: parse account blocks
+    for (let i = 0; i < aoa.length; i++) {
+      const row = aoa[i];
+      const cells = row.map(v => String(v || "").trim());
+
+      // Check for "Account Code" row — signals new account block
+      if (cells.includes("Account Code")) {
+        const acIdx = cells.indexOf("Account Code");
+        currentAccountCode = cells[acIdx + 1] || "";
+        currentAccountName = cells[acIdx + 2] || "";
+        continue;
+      }
+
+      // Skip summary/total rows
+      if (cells.some(c => ["Currency Total", "Period Total For", "Account Movement", "Account Total", "Balance Brought Forward"].some(kw => c.includes(kw)))) continue;
+      // Skip header rows (they repeat for each account)
+      if (cells.includes("Period") && cells.includes("Transaction Date")) continue;
+      // Skip empty rows
+      if (cells.filter(c => c).length < 3) continue;
+
+      // Transaction row — find the values
+      // Sun Systems pattern: [empty, Period, Date, Journal, TxnRef, Desc, Desc2, Desc3, Currency, TxnAmt, BaseAmt, RptAmt, DrCr, ProfitCentre, Dept]
+      const period = cells[1];
+      const date = cells[2];
+      const journalNo = cells[3];
+      const txnRef = cells[4];
+      const desc1 = cells[5];
+      const desc2 = cells[6];
+      const desc3 = cells[7];
+      const currency = cells[8];
+      const txnAmount = parseAccNum(row[9]);
+      const baseAmount = parseAccNum(row[10]);
+      const drCr = cells[12];
+
+      // Validate this is a real transaction row (must have a date-like value or period)
+      if (!period || (!date && !journalNo)) continue;
+      if (!/^\d{4}\/\d{3}$/.test(period) && !/^\d{4}[-\/]/.test(date)) continue;
+
+      const amount = baseAmount || txnAmount;
+      const description = [desc1, desc2, desc3].filter(Boolean).join(" ");
+      const vendor = extractVendor(description, txnRef);
+
+      glRows.push({
+        accountCode: currentAccountCode,
+        accountName: currentAccountName,
+        date: date,
+        description,
+        debit: drCr === "D" ? Math.abs(amount) : 0,
+        credit: drCr === "C" ? Math.abs(amount) : 0,
+        net: amount,
+        reference: txnRef || journalNo,
+        vendor,
+      });
+    }
+  } else {
+    // Flat table format — find header row and parse normally
+    const headerIdx = findHeaderRow(aoa);
+    const headers = aoa[headerIdx] || [];
+    const hLower = headers.map(h => String(h || "").toLowerCase().trim());
+
+    const findIdx = (candidates) => hLower.findIndex(h => candidates.some(c => h.includes(c)));
+    const acctIdx = findIdx(["account code", "account", "acct", "nominal code", "gl code"]);
+    const acctNameIdx = findIdx(["account name", "nominal name"]);
+    const dateIdx = findIdx(["date", "transaction date"]);
+    const descIdx = findIdx(["description", "narration", "memo", "details"]);
+    const debitIdx = findIdx(["debit"]);
+    const creditIdx = findIdx(["credit"]);
+    const amountIdx = debitIdx === -1 && creditIdx === -1 ? findIdx(["amount", "gross", "net amount", "base amount", "transaction amount"]) : -1;
+    const refIdx = findIdx(["reference", "ref", "transaction reference"]);
+    const vendorColIdx = findIdx(["contact", "vendor", "supplier", "contact name", "card name", "business partner"]);
+
+    for (let i = headerIdx + 1; i < aoa.length; i++) {
+      const row = aoa[i];
+      let debit = 0, credit = 0;
+      if (debitIdx >= 0 && creditIdx >= 0) {
+        debit = parseAccNum(row[debitIdx]);
+        credit = parseAccNum(row[creditIdx]);
+      } else if (amountIdx >= 0) {
+        const amt = parseAccNum(row[amountIdx]);
+        if (amt > 0) debit = amt; else credit = Math.abs(amt);
+      }
+      if (!debit && !credit) continue;
+
+      const descVal = descIdx >= 0 ? String(row[descIdx] || "") : "";
+      const vendorHint = vendorColIdx >= 0 ? String(row[vendorColIdx] || "") : null;
+      const vendor = extractVendor(descVal, vendorHint);
+
+      glRows.push({
+        accountCode: String(row[acctIdx >= 0 ? acctIdx : 0] || "").trim(),
+        accountName: acctNameIdx >= 0 ? String(row[acctNameIdx] || "") : "",
+        date: dateIdx >= 0 ? String(row[dateIdx] || "") : "",
+        description: descVal,
+        debit, credit, net: debit - credit,
+        reference: refIdx >= 0 ? String(row[refIdx] || "") : "",
+        vendor,
+      });
+    }
+  }
+
+  return glRows;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1264,71 +1555,21 @@ export default function App() {
     setMode("analyzing");
     setTimeout(() => {
       try {
-        const pnlSheet = workbook.sheets[sheetMapping.pnl];
-        const glSheet = workbook.sheets[sheetMapping.gl];
+        const pnlAoa = workbook.sheets[sheetMapping.pnl].aoa;
+        const glAoa = workbook.sheets[sheetMapping.gl].aoa;
 
         // Parse P&L
-        const pnlRaw = pnlSheet.data;
-        const pnlCols = pnlSheet.columns;
-        const standardCols = new Set();
-        pnlCols.forEach(c => {
-          const cl = c.toLowerCase();
-          if (cl.includes("code") || cl === "account" || cl.includes("description") || cl.includes("name") || cl.includes("account name")) standardCols.add(c);
-        });
-        const months = pnlCols.filter(c => !standardCols.has(c));
-        const codeCol = pnlCols.find(c => c.toLowerCase().includes("code") || c.toLowerCase() === "account") || pnlCols[0];
-        const descCol = pnlCols.find(c => c.toLowerCase().includes("description") || c.toLowerCase().includes("name")) || (pnlCols[1] !== codeCol ? pnlCols[1] : pnlCols[0]);
+        setLoadingMsg("Parsing P&L structure...");
+        const { pnlData, months } = parsePnlSheet(pnlAoa);
 
-        const pnlData = pnlRaw.map(row => {
-          const r = { code: String(row[codeCol] || "").trim(), desc: String(row[descCol] || "").trim(), type: "expense" };
-          const isTotal = ["TOTAL", "GROSS PROFIT", "NET PROFIT", "EBITDA", "NET INCOME", "PROFIT BEFORE TAX"].some(kw => r.desc.toUpperCase().includes(kw));
-          if (isTotal) r.type = "total";
-          // Classify line
-          const cat = classifyPnlLine(r.desc);
-          if (cat === "revenue") r.type = "revenue";
-          months.forEach(m => { r[m] = parseAccNum(row[m]); });
-          return r;
-        }).filter(r => r.desc); // remove empty rows
+        if (months.length === 0) throw new Error("Could not detect any month columns in the P&L sheet. Check that the sheet has columns like \"Jan '26\", \"Feb '26\" etc.");
+        if (pnlData.length === 0) throw new Error("No data rows found in P&L sheet.");
 
         // Parse GL
-        const glRaw = glSheet.data;
-        const glCols = glSheet.columns;
-        const findCol = (candidates) => glCols.find(c => candidates.some(cand => c.toLowerCase().includes(cand.toLowerCase())));
-        const acctCol = findCol(["Account Code", "Account", "Acct", "Nominal Code", "GL Code"]) || glCols[0];
-        const acctNameCol = findCol(["Account Name", "Nominal Name"]);
-        const dateCol = findCol(["Date", "Transaction Date"]);
-        const descGlCol = findCol(["Description", "Narration", "Memo", "Details"]);
-        const debitCol = findCol(["Debit"]);
-        const creditCol = findCol(["Credit"]);
-        const amountCol = !debitCol && !creditCol ? findCol(["Amount", "Gross", "Net Amount"]) : null;
-        const refCol = findCol(["Reference", "Ref"]);
-        const vendorCol = findCol(["Contact", "Vendor", "Name", "Supplier", "Contact Name", "Card Name", "Business Partner"]);
-
         setLoadingMsg("Extracting vendors from GL...");
+        const glRows = parseGlSheet(glAoa);
 
-        const glRows = glRaw.map(row => {
-          let debit = 0, credit = 0;
-          if (debitCol && creditCol) {
-            debit = parseAccNum(row[debitCol]);
-            credit = parseAccNum(row[creditCol]);
-          } else if (amountCol) {
-            const amt = parseAccNum(row[amountCol]);
-            if (amt > 0) debit = amt; else credit = Math.abs(amt);
-          }
-          const vendor = extractVendor(
-            descGlCol ? String(row[descGlCol] || "") : "",
-            vendorCol ? String(row[vendorCol] || "") : null
-          );
-          return {
-            accountCode: String(row[acctCol] || "").trim(),
-            accountName: acctNameCol ? String(row[acctNameCol] || "") : "",
-            date: dateCol ? String(row[dateCol] || "") : "",
-            description: descGlCol ? String(row[descGlCol] || "") : "",
-            debit, credit, net: debit - credit,
-            reference: refCol ? String(row[refCol] || "") : "",
-            vendor,
-          };
-        }).filter(r => r.accountCode && (r.debit || r.credit)); // remove empty rows
+        if (glRows.length === 0) throw new Error("No transaction rows found in GL sheet. Check the GL sheet contains transaction-level data.");
 
         setLoadingMsg("Running analysis...");
 
@@ -1433,12 +1674,12 @@ export default function App() {
                 style={{ width: "100%", padding: "10px 12px", border: `2px solid ${sheetMapping.pnl ? COLORS.good : COLORS.border}`, borderRadius: 8, fontSize: 14, background: sheetMapping.pnl ? "#E8F5E9" : "#fff" }}>
                 <option value="">— Select P&L sheet —</option>
                 {workbook.sheetNames.map(name => (
-                  <option key={name} value={name}>{name} ({workbook.sheets[name].rowCount} rows, {workbook.sheets[name].columns.length} cols)</option>
+                  <option key={name} value={name}>{name} ({workbook.sheets[name].rowCount} rows)</option>
                 ))}
               </select>
               {sheetMapping.pnl && (
                 <div style={{ fontSize: 11, color: COLORS.good, marginTop: 4 }}>
-                  ✓ Columns: {workbook.sheets[sheetMapping.pnl].columns.slice(0, 6).join(", ")}{workbook.sheets[sheetMapping.pnl].columns.length > 6 ? "..." : ""}
+                  ✓ Headers (row {workbook.sheets[sheetMapping.pnl].headerRow + 1}): {workbook.sheets[sheetMapping.pnl].columns.slice(0, 6).join(", ")}{workbook.sheets[sheetMapping.pnl].columns.length > 6 ? "..." : ""}
                 </div>
               )}
             </div>
@@ -1449,12 +1690,12 @@ export default function App() {
                 style={{ width: "100%", padding: "10px 12px", border: `2px solid ${sheetMapping.gl ? COLORS.good : COLORS.border}`, borderRadius: 8, fontSize: 14, background: sheetMapping.gl ? "#E8F5E9" : "#fff" }}>
                 <option value="">— Select GL sheet —</option>
                 {workbook.sheetNames.filter(n => n !== sheetMapping.pnl).map(name => (
-                  <option key={name} value={name}>{name} ({workbook.sheets[name].rowCount} rows, {workbook.sheets[name].columns.length} cols)</option>
+                  <option key={name} value={name}>{name} ({workbook.sheets[name].rowCount} rows)</option>
                 ))}
               </select>
               {sheetMapping.gl && (
                 <div style={{ fontSize: 11, color: COLORS.good, marginTop: 4 }}>
-                  ✓ Columns: {workbook.sheets[sheetMapping.gl].columns.slice(0, 6).join(", ")}{workbook.sheets[sheetMapping.gl].columns.length > 6 ? "..." : ""}
+                  ✓ Headers (row {workbook.sheets[sheetMapping.gl].headerRow + 1}): {workbook.sheets[sheetMapping.gl].columns.slice(0, 6).join(", ")}{workbook.sheets[sheetMapping.gl].columns.length > 6 ? "..." : ""}
                 </div>
               )}
             </div>
