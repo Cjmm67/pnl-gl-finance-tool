@@ -1065,21 +1065,79 @@ function NotesTab({ analysis }) {
 // ════════════════════════════════════════════════════════════════
 // FILE UPLOAD HANDLER
 // ════════════════════════════════════════════════════════════════
-function parseUploadedFile(file) {
+// GL sheet detection: must have columns like Date, Debit/Credit, Description/Narration
+const GL_SIGNATURES = ["debit", "credit", "narration", "description", "reference", "ref", "memo", "contact", "vendor", "supplier"];
+const PNL_KEYWORDS = ["revenue", "sales", "turnover", "income", "cost of goods", "cogs", "gross profit", "operating", "net profit", "ebitda"];
+
+function classifySheet(headers, rows) {
+  const lower = headers.map(h => String(h).toLowerCase().trim());
+  // GL sheets have debit/credit columns or amount + date + description
+  const hasDebitCredit = lower.some(h => h.includes("debit")) && lower.some(h => h.includes("credit"));
+  const hasAmount = lower.some(h => h === "amount" || h === "gross" || h === "net amount");
+  const hasDate = lower.some(h => h.includes("date"));
+  const hasDesc = lower.some(h => ["description", "narration", "memo", "details"].some(k => h.includes(k)));
+  const hasAcctCode = lower.some(h => ["account code", "account", "acct", "nominal code", "gl code"].some(k => h.includes(k)));
+  const glScore = (hasDebitCredit ? 3 : 0) + (hasAmount ? 2 : 0) + (hasDate ? 2 : 0) + (hasDesc ? 2 : 0) + (hasAcctCode ? 1 : 0);
+
+  // P&L sheets have month/period columns and line item descriptions with financial keywords
+  const monthPattern = /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|q[1-4]|ytd|total|fy|full year)/i;
+  const monthCols = headers.filter(h => monthPattern.test(String(h).trim()));
+  const descValues = rows.slice(0, 30).map(r => String(r[headers[0]] || r[headers[1]] || "").toLowerCase());
+  const pnlKeywordHits = descValues.filter(v => PNL_KEYWORDS.some(kw => v.includes(kw))).length;
+  const pnlScore = monthCols.length * 2 + pnlKeywordHits;
+
+  return { glScore, pnlScore, monthCols: monthCols.length, headers };
+}
+
+function parseWorkbook(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
         const data = new Uint8Array(e.target.result);
         const wb = XLSX.read(data, { type: "array" });
-        const sheet = wb.Sheets[wb.SheetNames[0]];
-        const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
-        resolve({ data: json, sheetNames: wb.SheetNames, rowCount: json.length, columns: json.length > 0 ? Object.keys(json[0]) : [] });
+        const sheets = {};
+        wb.SheetNames.forEach(name => {
+          const sheet = wb.Sheets[name];
+          const json = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+          const columns = json.length > 0 ? Object.keys(json[0]) : [];
+          const classification = classifySheet(columns, json);
+          sheets[name] = { data: json, columns, rowCount: json.length, ...classification };
+        });
+        resolve({ sheetNames: wb.SheetNames, sheets, fileName: file.name });
       } catch (err) { reject(err); }
     };
     reader.onerror = reject;
     reader.readAsArrayBuffer(file);
   });
+}
+
+function autoDetectSheets(workbook) {
+  const { sheets, sheetNames } = workbook;
+  let pnlSheet = null, glSheet = null;
+
+  // Score each sheet
+  const scored = sheetNames.map(name => {
+    const s = sheets[name];
+    return { name, glScore: s.glScore, pnlScore: s.pnlScore, rows: s.rowCount };
+  });
+
+  // Also check sheet name hints
+  scored.forEach(s => {
+    const lower = s.name.toLowerCase();
+    if (lower.includes("gl") || lower.includes("general ledger") || lower.includes("ledger") || lower.includes("detail") || lower.includes("transaction")) s.glScore += 5;
+    if (lower.includes("p&l") || lower.includes("pnl") || lower.includes("profit") || lower.includes("income") || lower.includes("summary")) s.pnlScore += 5;
+  });
+
+  // Pick best GL and best P&L (must be different sheets)
+  const byGl = [...scored].sort((a, b) => b.glScore - a.glScore);
+  const byPnl = [...scored].sort((a, b) => b.pnlScore - a.pnlScore);
+
+  if (byPnl[0].pnlScore > 0) pnlSheet = byPnl[0].name;
+  if (byGl[0].glScore > 0 && byGl[0].name !== pnlSheet) glSheet = byGl[0].name;
+  else if (byGl.length > 1 && byGl[1].glScore > 0) glSheet = byGl[1].name;
+
+  return { pnlSheet, glSheet, scored };
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1133,15 +1191,17 @@ function exportToExcel(analysis) {
 // MAIN APPLICATION
 // ════════════════════════════════════════════════════════════════
 export default function App() {
-  const [mode, setMode] = useState("landing"); // landing | analyzing | dashboard
+  const [mode, setMode] = useState("landing"); // landing | sheetSelect | analyzing | dashboard
   const [activeTab, setActiveTab] = useState("dashboard");
   const [industry, setIndustry] = useState("hospitality");
   const [assumptions, setAssumptions] = useState({ ...INDUSTRY_DEFAULTS.hospitality });
   const [rawData, setRawData] = useState(null);
   const [analysis, setAnalysis] = useState(null);
-  const [uploadStatus, setUploadStatus] = useState({ pnl: null, gl: null });
   const [entityName, setEntityName] = useState("1-Group");
   const [loadingMsg, setLoadingMsg] = useState("");
+  const [workbook, setWorkbook] = useState(null);
+  const [sheetMapping, setSheetMapping] = useState({ pnl: null, gl: null });
+  const [uploadError, setUploadError] = useState(null);
 
   // Run analysis whenever assumptions change
   useEffect(() => {
@@ -1151,67 +1211,114 @@ export default function App() {
     }
   }, [rawData, assumptions]);
 
-  const handleDemo = () => {
-    setLoadingMsg("Generating demo data...");
-    setMode("analyzing");
-    setTimeout(() => {
-      const demo = generateDemoData();
-      setRawData(demo);
-      const result = runAnalysis(demo.pnlData, demo.glRows, demo.months, assumptions);
-      setAnalysis(result);
-      setLoadingMsg("");
-      setMode("dashboard");
-    }, 800);
-  };
-
-  const handleFileUpload = async (type, file) => {
+  const handleFileUpload = async (file) => {
+    setUploadError(null);
     try {
-      const parsed = await parseUploadedFile(file);
-      setUploadStatus(prev => ({ ...prev, [type]: { name: file.name, rows: parsed.rowCount, cols: parsed.columns.length, columns: parsed.columns, data: parsed.data } }));
+      const wb = await parseWorkbook(file);
+      setWorkbook(wb);
+
+      // Try to extract entity name from filename
+      const nameMatch = file.name.replace(/\.[^.]+$/, "").replace(/[-_]/g, " ");
+      if (nameMatch.length > 3 && nameMatch.length < 60) {
+        // Try to find entity name patterns
+        const entityMatch = nameMatch.match(/^(?:Copy of )?(?:S\d+\s+)?(.+?)(?:\s+(?:Management|Financial|Finance|Report|P&L|GL|FY\d{2,4}|20\d{2}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec))/i);
+        if (entityMatch) setEntityName(entityMatch[1].trim());
+      }
+
+      if (wb.sheetNames.length === 1) {
+        // Single sheet — need to determine if it's P&L or GL
+        const sheet = wb.sheets[wb.sheetNames[0]];
+        if (sheet.glScore > sheet.pnlScore) {
+          setSheetMapping({ pnl: null, gl: wb.sheetNames[0] });
+          setUploadError("This file appears to contain only GL data. The workbook needs both a P&L sheet and a GL sheet.");
+          setMode("sheetSelect");
+        } else {
+          setSheetMapping({ pnl: wb.sheetNames[0], gl: null });
+          setUploadError("This file appears to contain only P&L data. The workbook needs both a P&L sheet and a GL sheet.");
+          setMode("sheetSelect");
+        }
+        return;
+      }
+
+      // Multi-sheet — auto-detect
+      const detected = autoDetectSheets(wb);
+      setSheetMapping({ pnl: detected.pnlSheet, gl: detected.glSheet });
+
+      if (detected.pnlSheet && detected.glSheet) {
+        setMode("sheetSelect"); // Let user confirm before running
+      } else {
+        setUploadError("Could not auto-detect both P&L and GL sheets. Please select them manually.");
+        setMode("sheetSelect");
+      }
     } catch (e) {
-      alert(`Error reading file: ${e.message}`);
+      setUploadError(`Error reading file: ${e.message}`);
     }
   };
 
-  const handleAnalyzeUploaded = () => {
-    if (!uploadStatus.pnl || !uploadStatus.gl) { alert("Please upload both P&L and GL files"); return; }
-    setLoadingMsg("Analyzing uploaded data...");
+  const handleAnalyze = () => {
+    if (!sheetMapping.pnl || !sheetMapping.gl) {
+      setUploadError("Please select both a P&L sheet and a GL sheet.");
+      return;
+    }
+    setLoadingMsg("Parsing P&L structure...");
     setMode("analyzing");
     setTimeout(() => {
       try {
+        const pnlSheet = workbook.sheets[sheetMapping.pnl];
+        const glSheet = workbook.sheets[sheetMapping.gl];
+
         // Parse P&L
-        const pnlRaw = uploadStatus.pnl.data;
-        const standardCols = new Set(["Account Code", "Account", "Description", "Account Name"]);
-        const pnlCols = uploadStatus.pnl.columns;
+        const pnlRaw = pnlSheet.data;
+        const pnlCols = pnlSheet.columns;
+        const standardCols = new Set();
+        pnlCols.forEach(c => {
+          const cl = c.toLowerCase();
+          if (cl.includes("code") || cl === "account" || cl.includes("description") || cl.includes("name") || cl.includes("account name")) standardCols.add(c);
+        });
         const months = pnlCols.filter(c => !standardCols.has(c));
         const codeCol = pnlCols.find(c => c.toLowerCase().includes("code") || c.toLowerCase() === "account") || pnlCols[0];
-        const descCol = pnlCols.find(c => c.toLowerCase().includes("description") || c.toLowerCase().includes("name")) || pnlCols[1];
+        const descCol = pnlCols.find(c => c.toLowerCase().includes("description") || c.toLowerCase().includes("name")) || (pnlCols[1] !== codeCol ? pnlCols[1] : pnlCols[0]);
 
         const pnlData = pnlRaw.map(row => {
           const r = { code: String(row[codeCol] || "").trim(), desc: String(row[descCol] || "").trim(), type: "expense" };
-          const isTotal = ["TOTAL", "GROSS PROFIT", "NET PROFIT", "EBITDA"].some(kw => r.desc.toUpperCase().includes(kw));
+          const isTotal = ["TOTAL", "GROSS PROFIT", "NET PROFIT", "EBITDA", "NET INCOME", "PROFIT BEFORE TAX"].some(kw => r.desc.toUpperCase().includes(kw));
           if (isTotal) r.type = "total";
+          // Classify line
+          const cat = classifyPnlLine(r.desc);
+          if (cat === "revenue") r.type = "revenue";
           months.forEach(m => { r[m] = parseAccNum(row[m]); });
           return r;
-        });
+        }).filter(r => r.desc); // remove empty rows
 
         // Parse GL
-        const glRaw = uploadStatus.gl.data;
-        const glCols = uploadStatus.gl.columns;
-        const findCol = (candidates) => glCols.find(c => candidates.some(cand => c.toUpperCase().includes(cand.toUpperCase())));
-        const acctCol = findCol(["Account Code", "Account", "Acct"]) || glCols[0];
-        const acctNameCol = findCol(["Account Name"]);
-        const dateCol = findCol(["Date"]);
-        const descGlCol = findCol(["Description", "Narration", "Memo"]);
+        const glRaw = glSheet.data;
+        const glCols = glSheet.columns;
+        const findCol = (candidates) => glCols.find(c => candidates.some(cand => c.toLowerCase().includes(cand.toLowerCase())));
+        const acctCol = findCol(["Account Code", "Account", "Acct", "Nominal Code", "GL Code"]) || glCols[0];
+        const acctNameCol = findCol(["Account Name", "Nominal Name"]);
+        const dateCol = findCol(["Date", "Transaction Date"]);
+        const descGlCol = findCol(["Description", "Narration", "Memo", "Details"]);
         const debitCol = findCol(["Debit"]);
         const creditCol = findCol(["Credit"]);
+        const amountCol = !debitCol && !creditCol ? findCol(["Amount", "Gross", "Net Amount"]) : null;
         const refCol = findCol(["Reference", "Ref"]);
-        const vendorCol = findCol(["Contact", "Vendor", "Name", "Supplier"]);
+        const vendorCol = findCol(["Contact", "Vendor", "Name", "Supplier", "Contact Name", "Card Name", "Business Partner"]);
+
+        setLoadingMsg("Extracting vendors from GL...");
 
         const glRows = glRaw.map(row => {
-          const debit = parseAccNum(row[debitCol]);
-          const credit = parseAccNum(row[creditCol]);
-          const vendor = extractVendor(row[descGlCol], vendorCol ? row[vendorCol] : null);
+          let debit = 0, credit = 0;
+          if (debitCol && creditCol) {
+            debit = parseAccNum(row[debitCol]);
+            credit = parseAccNum(row[creditCol]);
+          } else if (amountCol) {
+            const amt = parseAccNum(row[amountCol]);
+            if (amt > 0) debit = amt; else credit = Math.abs(amt);
+          }
+          const vendor = extractVendor(
+            descGlCol ? String(row[descGlCol] || "") : "",
+            vendorCol ? String(row[vendorCol] || "") : null
+          );
           return {
             accountCode: String(row[acctCol] || "").trim(),
             accountName: acctNameCol ? String(row[acctNameCol] || "") : "",
@@ -1221,7 +1328,9 @@ export default function App() {
             reference: refCol ? String(row[refCol] || "") : "",
             vendor,
           };
-        });
+        }).filter(r => r.accountCode && (r.debit || r.credit)); // remove empty rows
+
+        setLoadingMsg("Running analysis...");
 
         setRawData({ pnlData, glRows, months });
         const result = runAnalysis(pnlData, glRows, months, assumptions);
@@ -1229,48 +1338,125 @@ export default function App() {
         setLoadingMsg("");
         setMode("dashboard");
       } catch (e) {
-        alert(`Analysis error: ${e.message}`);
-        setMode("landing");
+        alert(`Analysis error: ${e.message}\n\nPlease check your file contains both a P&L summary sheet and a GL detail sheet.`);
+        setMode("sheetSelect");
         setLoadingMsg("");
       }
-    }, 500);
+    }, 300);
   };
 
   // ─── LANDING PAGE ───
   if (mode === "landing") {
     return (
       <div style={{ minHeight: "100vh", background: `linear-gradient(135deg, ${COLORS.hdrDark} 0%, ${COLORS.hdrMid} 50%, ${COLORS.hdrLight} 100%)`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif" }}>
-        <div style={{ width: "100%", maxWidth: 800, padding: 40 }}>
+        <div style={{ width: "100%", maxWidth: 680, padding: 40 }}>
           <div style={{ textAlign: "center", marginBottom: 40 }}>
             <div style={{ fontSize: 48, marginBottom: 8 }}>📊</div>
             <h1 style={{ color: "#fff", fontSize: 32, fontWeight: 300, margin: 0, letterSpacing: "-0.5px" }}>
               P&L <span style={{ fontWeight: 700 }}>&</span> GL Financial Analysis
             </h1>
-            <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, marginTop: 8 }}>
-              Cross-reference your P&L with General Ledger detail for comprehensive expense breakdowns, vendor attribution, and variance analysis.
+            <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 16, marginTop: 8, lineHeight: 1.5 }}>
+              Upload your combined P&L and GL workbook for comprehensive expense breakdowns, vendor attribution, and variance analysis.
             </p>
           </div>
 
           <div style={{ background: "rgba(255,255,255,0.95)", borderRadius: 16, padding: 32, backdropFilter: "blur(20px)", boxShadow: "0 20px 60px rgba(0,0,0,0.3)" }}>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 24 }}>
-              {["pnl", "gl"].map(type => (
-                <div key={type}
-                  onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = COLORS.accent; }}
-                  onDragLeave={e => { e.currentTarget.style.borderColor = COLORS.border; }}
-                  onDrop={e => { e.preventDefault(); e.currentTarget.style.borderColor = COLORS.border; if (e.dataTransfer.files[0]) handleFileUpload(type, e.dataTransfer.files[0]); }}
-                  style={{ border: `2px dashed ${uploadStatus[type] ? COLORS.good : COLORS.border}`, borderRadius: 12, padding: 24, textAlign: "center", cursor: "pointer", transition: "all 0.2s", background: uploadStatus[type] ? "#E8F5E9" : COLORS.bgLight }}
-                  onClick={() => { const inp = document.createElement("input"); inp.type = "file"; inp.accept = ".xlsx,.xls,.csv"; inp.onchange = e => handleFileUpload(type, e.target.files[0]); inp.click(); }}>
-                  <div style={{ fontSize: 28, marginBottom: 8 }}>{type === "pnl" ? "📋" : "📒"}</div>
-                  <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.hdrDark }}>{type === "pnl" ? "P&L Report" : "GL Detail"}</div>
-                  {uploadStatus[type] ? (
-                    <div style={{ marginTop: 8, fontSize: 12, color: COLORS.good }}>
-                      ✓ {uploadStatus[type].name}<br />{uploadStatus[type].rows} rows × {uploadStatus[type].cols} columns
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>Drop file here or click to browse<br />.xlsx, .csv</div>
-                  )}
+            <div
+              onDragOver={e => { e.preventDefault(); e.currentTarget.style.borderColor = COLORS.accent; e.currentTarget.style.background = "#FFF3E0"; }}
+              onDragLeave={e => { e.currentTarget.style.borderColor = COLORS.border; e.currentTarget.style.background = COLORS.bgLight; }}
+              onDrop={e => { e.preventDefault(); e.currentTarget.style.borderColor = COLORS.border; e.currentTarget.style.background = COLORS.bgLight; if (e.dataTransfer.files[0]) handleFileUpload(e.dataTransfer.files[0]); }}
+              onClick={() => { const inp = document.createElement("input"); inp.type = "file"; inp.accept = ".xlsx,.xls,.csv"; inp.onchange = e => handleFileUpload(e.target.files[0]); inp.click(); }}
+              style={{ border: `2px dashed ${COLORS.border}`, borderRadius: 12, padding: 40, textAlign: "center", cursor: "pointer", transition: "all 0.2s", background: COLORS.bgLight, marginBottom: 20 }}>
+              <div style={{ fontSize: 40, marginBottom: 12 }}>📁</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: COLORS.hdrDark, marginBottom: 6 }}>Upload Combined P&L & GL Workbook</div>
+              <div style={{ fontSize: 13, color: "#888", lineHeight: 1.5 }}>
+                Drop your Excel file here or click to browse<br />
+                <span style={{ fontSize: 11 }}>Workbook should contain a P&L summary sheet and a GL detail sheet</span>
+              </div>
+            </div>
+
+            {uploadError && (
+              <div style={{ background: "#FFEBEE", border: "1px solid #EF9A9A", borderRadius: 8, padding: 12, marginBottom: 16, fontSize: 13, color: COLORS.bad }}>
+                ⚠️ {uploadError}
+              </div>
+            )}
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: "#666" }}>Entity Name</label>
+                <input type="text" value={entityName} onChange={e => setEntityName(e.target.value)}
+                  style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 13, marginTop: 4, boxSizing: "border-box" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 12, fontWeight: 600, color: "#666" }}>Industry</label>
+                <select value={industry} onChange={e => { setIndustry(e.target.value); setAssumptions({ ...INDUSTRY_DEFAULTS[e.target.value] }); }}
+                  style={{ width: "100%", padding: "8px 12px", border: `1px solid ${COLORS.border}`, borderRadius: 6, fontSize: 13, marginTop: 4 }}>
+                  <option value="hospitality">Hospitality / F&B</option>
+                  <option value="retail">Retail</option>
+                  <option value="professional_services">Professional Services</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ textAlign: "center", marginTop: 20, color: "rgba(255,255,255,0.5)", fontSize: 12 }}>
+            Supports Xero, QuickBooks, MYOB, SAP, Sage, NetSuite, Dynamics & generic GL exports
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── SHEET SELECTION ───
+  if (mode === "sheetSelect" && workbook) {
+    return (
+      <div style={{ minHeight: "100vh", background: `linear-gradient(135deg, ${COLORS.hdrDark} 0%, ${COLORS.hdrMid} 50%, ${COLORS.hdrLight} 100%)`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif" }}>
+        <div style={{ width: "100%", maxWidth: 680, padding: 40 }}>
+          <div style={{ textAlign: "center", marginBottom: 24 }}>
+            <div style={{ fontSize: 36, marginBottom: 8 }}>📋</div>
+            <h2 style={{ color: "#fff", fontSize: 24, fontWeight: 300, margin: 0 }}>Confirm Sheet Mapping</h2>
+            <p style={{ color: "rgba(255,255,255,0.7)", fontSize: 14, marginTop: 8 }}>
+              <strong style={{ color: "#fff" }}>{workbook.fileName}</strong> — {workbook.sheetNames.length} sheet{workbook.sheetNames.length > 1 ? "s" : ""} detected
+            </p>
+          </div>
+
+          <div style={{ background: "rgba(255,255,255,0.95)", borderRadius: 16, padding: 32, boxShadow: "0 20px 60px rgba(0,0,0,0.3)" }}>
+            {uploadError && (
+              <div style={{ background: "#FFF8E1", border: "1px solid #FFE082", borderRadius: 8, padding: 12, marginBottom: 20, fontSize: 13, color: "#F57F17" }}>
+                ⚠️ {uploadError}
+              </div>
+            )}
+
+            <div style={{ marginBottom: 20 }}>
+              <label style={{ fontSize: 13, fontWeight: 700, color: COLORS.hdrDark, display: "block", marginBottom: 6 }}>📋 P&L Summary Sheet</label>
+              <select value={sheetMapping.pnl || ""} onChange={e => setSheetMapping(prev => ({ ...prev, pnl: e.target.value || null }))}
+                style={{ width: "100%", padding: "10px 12px", border: `2px solid ${sheetMapping.pnl ? COLORS.good : COLORS.border}`, borderRadius: 8, fontSize: 14, background: sheetMapping.pnl ? "#E8F5E9" : "#fff" }}>
+                <option value="">— Select P&L sheet —</option>
+                {workbook.sheetNames.map(name => (
+                  <option key={name} value={name}>{name} ({workbook.sheets[name].rowCount} rows, {workbook.sheets[name].columns.length} cols)</option>
+                ))}
+              </select>
+              {sheetMapping.pnl && (
+                <div style={{ fontSize: 11, color: COLORS.good, marginTop: 4 }}>
+                  ✓ Columns: {workbook.sheets[sheetMapping.pnl].columns.slice(0, 6).join(", ")}{workbook.sheets[sheetMapping.pnl].columns.length > 6 ? "..." : ""}
                 </div>
-              ))}
+              )}
+            </div>
+
+            <div style={{ marginBottom: 24 }}>
+              <label style={{ fontSize: 13, fontWeight: 700, color: COLORS.hdrDark, display: "block", marginBottom: 6 }}>📒 GL Detail Sheet</label>
+              <select value={sheetMapping.gl || ""} onChange={e => setSheetMapping(prev => ({ ...prev, gl: e.target.value || null }))}
+                style={{ width: "100%", padding: "10px 12px", border: `2px solid ${sheetMapping.gl ? COLORS.good : COLORS.border}`, borderRadius: 8, fontSize: 14, background: sheetMapping.gl ? "#E8F5E9" : "#fff" }}>
+                <option value="">— Select GL sheet —</option>
+                {workbook.sheetNames.filter(n => n !== sheetMapping.pnl).map(name => (
+                  <option key={name} value={name}>{name} ({workbook.sheets[name].rowCount} rows, {workbook.sheets[name].columns.length} cols)</option>
+                ))}
+              </select>
+              {sheetMapping.gl && (
+                <div style={{ fontSize: 11, color: COLORS.good, marginTop: 4 }}>
+                  ✓ Columns: {workbook.sheets[sheetMapping.gl].columns.slice(0, 6).join(", ")}{workbook.sheets[sheetMapping.gl].columns.length > 6 ? "..." : ""}
+                </div>
+              )}
             </div>
 
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
@@ -1291,19 +1477,15 @@ export default function App() {
             </div>
 
             <div style={{ display: "flex", gap: 12 }}>
-              <button onClick={handleAnalyzeUploaded} disabled={!uploadStatus.pnl || !uploadStatus.gl}
-                style={{ flex: 1, padding: "14px 24px", background: uploadStatus.pnl && uploadStatus.gl ? COLORS.accent : "#ccc", color: "#fff", border: "none", borderRadius: 8, fontSize: 15, fontWeight: 700, cursor: uploadStatus.pnl && uploadStatus.gl ? "pointer" : "not-allowed", transition: "all 0.2s" }}>
-                🚀 Analyze Files
+              <button onClick={() => { setMode("landing"); setWorkbook(null); setUploadError(null); }}
+                style={{ flex: 0, padding: "12px 20px", background: "#eee", color: "#666", border: "none", borderRadius: 8, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
+                ← Back
               </button>
-              <button onClick={handleDemo}
-                style={{ flex: 1, padding: "14px 24px", background: COLORS.hdrDark, color: "#fff", border: "none", borderRadius: 8, fontSize: 15, fontWeight: 700, cursor: "pointer", transition: "all 0.2s" }}>
-                🎮 Try Demo Data
+              <button onClick={handleAnalyze} disabled={!sheetMapping.pnl || !sheetMapping.gl}
+                style={{ flex: 1, padding: "14px 24px", background: sheetMapping.pnl && sheetMapping.gl ? COLORS.accent : "#ccc", color: "#fff", border: "none", borderRadius: 8, fontSize: 15, fontWeight: 700, cursor: sheetMapping.pnl && sheetMapping.gl ? "pointer" : "not-allowed", transition: "all 0.2s" }}>
+                🚀 Run Analysis
               </button>
             </div>
-          </div>
-
-          <div style={{ textAlign: "center", marginTop: 20, color: "rgba(255,255,255,0.5)", fontSize: 12 }}>
-            Supports Xero, QuickBooks, MYOB, SAP, Sage, NetSuite, Dynamics & generic GL exports
           </div>
         </div>
       </div>
@@ -1359,7 +1541,7 @@ export default function App() {
           <button onClick={() => exportToExcel(analysis)} style={{ padding: "8px 16px", background: COLORS.good, color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
             📥 Download Excel
           </button>
-          <button onClick={() => { setMode("landing"); setRawData(null); setAnalysis(null); setUploadStatus({ pnl: null, gl: null }); }}
+          <button onClick={() => { setMode("landing"); setRawData(null); setAnalysis(null); setWorkbook(null); setSheetMapping({ pnl: null, gl: null }); setUploadError(null); }}
             style={{ padding: "8px 16px", background: "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 6, cursor: "pointer", fontSize: 12, fontWeight: 600 }}>
             ← New Analysis
           </button>
